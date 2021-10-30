@@ -7,7 +7,7 @@ import string
 import threading
 import time
 from queue import Empty, PriorityQueue
-from typing import Dict, List, NamedTuple, Set
+from typing import Dict, NamedTuple, Optional, Set
 
 from localstack.aws.api import CommonServiceException, RequestContext
 from localstack.aws.api.sqs import (
@@ -44,7 +44,9 @@ from localstack.aws.api.sqs import (
 )
 from localstack.aws.spec import load_service
 from localstack.config import get_edge_url
-from localstack.utils.common import long_uid, md5, now
+from localstack.services.plugins import ServiceLifecycleHook
+from localstack.utils.common import long_uid, md5, now, start_thread
+from localstack.utils.run import FuncThread
 
 LOG = logging.getLogger(__name__)
 
@@ -172,6 +174,9 @@ class SqsQueue:
     def get(self, block=True, timeout=None) -> Message:
         raise NotImplementedError
 
+    def requeue_inflight_messages(self):
+        raise NotImplementedError
+
 
 class QueuedMessage:
     message: Message
@@ -180,7 +185,7 @@ class QueuedMessage:
     visibility_timeout: int
     deleted: bool
     receive_times: int
-    receipt_handles: List[str]
+    receipt_handles: Set[str]
 
     def __init__(self, priority: float, message: Message) -> None:
         super().__init__()
@@ -189,7 +194,7 @@ class QueuedMessage:
         self.message = message
         self.deleted = False
         self.receive_times = 0
-        self.receipt_handles = list()
+        self.receipt_handles = set()
 
         self.last_received = None
         self.first_received = None
@@ -223,7 +228,6 @@ class QueuedMessage:
 
 
 class StandardQueue(SqsQueue):
-
     visible: PriorityQueue
     inflight: Set[QueuedMessage]
     receipts: Dict[str, QueuedMessage]
@@ -247,41 +251,36 @@ class StandardQueue(SqsQueue):
 
             self.visible.put_nowait(qm)
 
-    def update(self):
-        # TODO: this should be called by a worker that updates queues regularly
-        with self._mutex:
-            messages = list(self.inflight)
-            for qm in messages:
-                if qm.is_visible:
-                    self.inflight.remove(qm)
-                    self.visible.put(qm)
-
     def get(self, block=True, timeout=None) -> Message:
-        qm: QueuedMessage = self.visible.get(block=block, timeout=timeout)
+        while True:
+            qm: QueuedMessage = self.visible.get(block=block, timeout=timeout)
+            LOG.debug("de-queued message %s from %s", qm.message_id, self.arn)
 
-        with self._mutex:
-            if qm.deleted:
-                pass  # TODO: how should receive-message behave here?
+            with self._mutex:
+                if qm.deleted:
+                    # TODO: check what the behavior of AWS is here. should we return a deleted message?
+                    # FIXME: timeout is not adjusted
+                    continue
 
-            receipt_handle = generate_receipt_handle()
+                receipt_handle = generate_receipt_handle()
 
-            # update message
-            qm.receipt_handles.append(receipt_handle)
-            qm.receive_times += 1
-            qm.last_received = time.time()
-            if qm.first_received is None:
-                qm.first_received = qm.last_received
+                # update message
+                qm.receipt_handles.add(receipt_handle)
+                qm.receive_times += 1
+                qm.last_received = time.time()
+                if qm.first_received is None:
+                    qm.first_received = qm.last_received
 
-            # update queue state
-            self.receipts[receipt_handle] = qm
-            self.inflight.add(qm)
+                # update queue state
+                self.receipts[receipt_handle] = qm
+                self.inflight.add(qm)
 
-            # prepare message for receiver
-            # TODO: update message attributes (ApproximateFirstReceiveTimestamp, ApproximateReceiveCount)
-            message = copy.deepcopy(qm.message)
-            message["ReceiptHandle"] = receipt_handle
+                # prepare message for receiver
+                # TODO: update message attributes (ApproximateFirstReceiveTimestamp, ApproximateReceiveCount)
+                message = copy.deepcopy(qm.message)
+                message["ReceiptHandle"] = receipt_handle
 
-        return message
+            return message
 
     def update_visibility_timeout(self, receipt_handle: str, visibility_timeout: int):
         with self._mutex:
@@ -294,35 +293,96 @@ class StandardQueue(SqsQueue):
 
     def remove(self, receipt_handle: str):
         with self._mutex:
-            if receipt_handle not in self.inflight:
+            if receipt_handle not in self.receipts:
+                LOG.debug(
+                    "no in-flight message found for receipt handle %s in queue %s",
+                    receipt_handle,
+                    self.arn,
+                )
                 return
 
             qm = self.receipts[receipt_handle]
             qm.deleted = True
+            LOG.debug("deleting message %s from queue %s", qm.message_id, self.arn)
 
             # remove all all handles
             for handle in qm.receipt_handles:
                 del self.receipts[handle]
+            qm.receipt_handles.clear()
 
             # remove in-flight message
-            self.inflight.remove(qm)
+            try:
+                self.inflight.remove(qm)
+            except KeyError:
+                # this means the message was re-queued in the meantime
+                # TODO: remove this message from the visible queue if it exists: a message can be removed with an old
+                #  receipt handle that was issued before the message was put back in the visible queue.
+                pass
 
-            # TODO: remove this message from the visible queue if it exists: a message can be removed with an old
-            #  receipt handle that was issued before the message was put back in the visible queue.
+    def requeue_inflight_messages(self):
+        if not self.inflight:
+            return
+
+        with self._mutex:
+            messages = list(self.inflight)
+            for qm in messages:
+                if qm.is_visible:
+                    LOG.debug(
+                        "re-queueing inflight messages %s into queue %s", qm.message_id, self.arn
+                    )
+                    self.inflight.remove(qm)
+                    self.visible.put_nowait(qm)
 
 
-class SqsProvider(SqsApi):
+class InflightUpdateWorker:
+    """
+    Regularly re-queues inflight messages whose visibility timeout has expired.
+
+    FIXME: very crude implementation. it would be better to have event-driven communication.
+    """
+
+    queues: Dict[QueueKey, SqsQueue]
+
+    def __init__(self, queues: Dict[QueueKey, SqsQueue]) -> None:
+        super().__init__()
+        self.queues = queues
+        self.running = False
+        self.thread: Optional[FuncThread] = None
+
+    def start(self):
+        if self.thread:
+            return
+
+        def _run(*_args):
+            self.running = True
+            self.run()
+
+        self.thread = start_thread(_run)
+
+    def stop(self):
+        if self.thread:
+            self.thread.stop()
+
+        self.running = False
+        self.thread = None
+
+    def run(self):
+        while self.running:
+            time.sleep(1)
+            for queue in self.queues.values():
+                queue.requeue_inflight_messages()
+
+
+class SqsProvider(SqsApi, ServiceLifecycleHook):
     """
     LocalStack SQS Provider.
 
     LIMITATIONS:
         - Calculation of message attribute MD5 hash.
-        - Message visiibility
-        - Message deletion
         - Pagination of results (NextToken)
         - Sequence numbering
         - Delivery guarantees
-        - Permissions are not real IAM policies
+        - Message batching
     """
 
     queues: Dict[QueueKey, SqsQueue]
@@ -333,6 +393,19 @@ class SqsProvider(SqsApi):
         self.queues = dict()
         self.queue_url_index = dict()
         self._mutex = threading.RLock()
+        self._inflight_worker = InflightUpdateWorker(self.queues)
+
+    def start(self):
+        self._inflight_worker.start()
+
+    def shutdown(self):
+        self._inflight_worker.stop()
+
+    def on_before_start(self):
+        self.start()
+
+    def on_before_stop(self):
+        self.shutdown()
 
     def _add_queue(self, queue: SqsQueue):
         with self._mutex:
@@ -367,7 +440,8 @@ class SqsProvider(SqsApi):
         if k in self.queues:
             raise QueueNameExists(queue_name)
 
-        queue = SqsQueue(k, attributes, tags)
+        queue = StandardQueue(k, attributes, tags)
+        LOG.debug("creating queue key=%s attributes=%s tags=%s", k, attributes, tags)
         self._add_queue(queue)
 
         return CreateQueueResult(QueueUrl=queue.url)
@@ -543,7 +617,9 @@ class SqsProvider(SqsApi):
     def delete_message(
         self, context: RequestContext, queue_url: String, receipt_handle: String
     ) -> None:
-        pass
+        queue = self._require_queue_by_url(queue_url)
+        self._assert_permission(context, queue)
+        queue.remove(receipt_handle)
 
     def purge_queue(self, context: RequestContext, queue_url: String) -> None:
         queue = self._require_queue_by_url(queue_url)

@@ -138,6 +138,7 @@ class Skeleton:
         else:
             # otherwise parse the incoming HTTPRequest
             operation, instance = self.parser.parse(context.request)
+            context.operation = operation
 
         serializer = self.serializer
 

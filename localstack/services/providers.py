@@ -206,7 +206,9 @@ def sqs_custom():
     from localstack.aws.proxy import AwsApiListener
     from localstack.services.sqs.provider import SqsProvider
 
-    return Service("sqs", listener=AwsApiListener("sqs", SqsProvider()))
+    provider = SqsProvider()
+
+    return Service("sqs", listener=AwsApiListener("sqs", provider), lifecycle_hook=provider)
 
 
 @aws_provider()

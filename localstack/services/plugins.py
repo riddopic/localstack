@@ -14,7 +14,7 @@ from requests.models import Request
 from localstack import config
 from localstack.config import ServiceProviderConfig
 from localstack.utils.bootstrap import get_enabled_apis, is_api_enabled, log_duration
-from localstack.utils.common import poll_condition, wait_for_port_status
+from localstack.utils.common import call_safe, poll_condition, wait_for_port_status
 
 # set up logger
 LOG = logging.getLogger(__name__)
@@ -117,16 +117,43 @@ class ServiceStateException(ServiceException):
     pass
 
 
+class ServiceLifecycleHook:
+    def on_after_init(self):
+        pass
+
+    def on_before_start(self):
+        pass
+
+    def on_before_stop(self):
+        pass
+
+    def on_exception(self):
+        pass
+
+
 class Service(object):
-    def __init__(self, name, start=None, check=_default, listener=None, active=False, stop=None):
+    def __init__(
+        self,
+        name,
+        start=None,
+        check=_default,
+        listener=None,
+        active=False,
+        stop=None,
+        lifecycle_hook: ServiceLifecycleHook = None,
+    ):
         self.plugin_name = name
         self.start_function = start
         self.listener = listener
         self.check_function = check if check is not _default else local_api_checker(name)
         self.default_active = active
         self.stop_function = stop
+        self.lifecycle_hook = lifecycle_hook or ServiceLifecycleHook()
+        call_safe(self.lifecycle_hook.on_after_init)
 
     def start(self, asynchronous):
+        call_safe(self.lifecycle_hook.on_before_start)
+
         if not self.start_function:
             # fallback start method that simply adds the listener function to the list of proxy listeners if it exists
             if not self.listener:
@@ -143,6 +170,7 @@ class Service(object):
         return self.start_function(**kwargs)
 
     def stop(self):
+        call_safe(self.lifecycle_hook.on_before_stop)
         if not self.stop_function:
             return
         return self.stop_function()

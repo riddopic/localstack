@@ -91,20 +91,6 @@ class ProxyListenerEdge(ProxyListener):
         if method == "POST" and path == "/graph":
             return serve_resource_graph(data)
 
-        # with open(f"/tmp/localstack/requests/r-{time.time()}-{short_uid()}.json", "w") as fd:
-        with open("/tmp/localstack/requests/requests.json", "a") as fd:
-            fd.write(
-                json.dumps(
-                    {
-                        "method": method,
-                        "path": path,
-                        "data": to_str(data),
-                        "headers": dict(headers),
-                    }
-                )
-            )
-            fd.write(os.linesep)
-
         # kill the process if we receive this header
         headers.get(HEADER_KILL_SIGNAL) and sys.exit(0)
 
