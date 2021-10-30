@@ -76,6 +76,10 @@ class NonExistentQueue(CommonServiceException):
 
 
 def assert_queue_name(queue_name: str):
+    if queue_name.endswith(".fifo"):
+        # The .fifo suffix counts towards the 80-character queue name quota.
+        queue_name = queue_name[:-5] + "_fifo"
+
     if not re.match(r"^[a-zA-Z0-9_-]{1,80}$", queue_name):
         raise InvalidParameterValues(
             "Can only include alphanumeric characters, hyphens, or underscores. 1 to 80 in length"
@@ -159,7 +163,7 @@ class SqsQueue:
         )
 
     @property
-    def visibility_timeout(self):
+    def visibility_timeout(self) -> int:
         return int(self.attributes[QueueAttributeName.VisibilityTimeout])
 
     def update_visibility_timeout(self, receipt_handle: str, visibility_timeout: int):
@@ -171,7 +175,7 @@ class SqsQueue:
     def put(self, message: Message, visibility_timeout=None):
         raise NotImplementedError
 
-    def get(self, block=True, timeout=None) -> Message:
+    def get(self, block=True, timeout=None, visibility_timeout: int = None) -> Message:
         raise NotImplementedError
 
     def requeue_inflight_messages(self):
@@ -227,7 +231,7 @@ class QueuedMessage:
         return self.message_id.__hash__()
 
 
-class StandardQueue(SqsQueue):
+class FifoQueue(SqsQueue):
     visible: PriorityQueue
     inflight: Set[QueuedMessage]
     receipts: Dict[str, QueuedMessage]
@@ -251,7 +255,7 @@ class StandardQueue(SqsQueue):
 
             self.visible.put_nowait(qm)
 
-    def get(self, block=True, timeout=None) -> Message:
+    def get(self, block=True, timeout=None, visibility_timeout: int = None) -> Message:
         while True:
             qm: QueuedMessage = self.visible.get(block=block, timeout=timeout)
             LOG.debug("de-queued message %s from %s", qm.message_id, self.arn)
@@ -262,18 +266,24 @@ class StandardQueue(SqsQueue):
                     # FIXME: timeout is not adjusted
                     continue
 
-                receipt_handle = generate_receipt_handle()
-
-                # update message
-                qm.receipt_handles.add(receipt_handle)
+                # update message attributes
+                qm.visibility_timeout = (
+                    self.visibility_timeout if visibility_timeout is None else visibility_timeout
+                )
                 qm.receive_times += 1
                 qm.last_received = time.time()
                 if qm.first_received is None:
                     qm.first_received = qm.last_received
 
-                # update queue state
+                # create and manage receipt handle
+                receipt_handle = generate_receipt_handle()
+                qm.receipt_handles.add(receipt_handle)
                 self.receipts[receipt_handle] = qm
-                self.inflight.add(qm)
+
+                if self.visibility_timeout == 0:
+                    self.visible.put_nowait(qm)
+                else:
+                    self.inflight.add(qm)
 
                 # prepare message for receiver
                 # TODO: update message attributes (ApproximateFirstReceiveTimestamp, ApproximateReceiveCount)
@@ -290,6 +300,15 @@ class StandardQueue(SqsQueue):
 
             if qm not in self.inflight:
                 raise MessageNotInflight()
+
+            # TODO: is the visibility timeout permanently changed?
+            qm.visibility_timeout = visibility_timeout
+
+            if visibility_timeout == 0:
+                # Terminating the visibility timeout for a message
+                # https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html#terminating-message-visibility-timeout
+                self.inflight.remove(qm)
+                self.visible.put_nowait(qm)
 
     def remove(self, receipt_handle: str):
         with self._mutex:
@@ -378,11 +397,13 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
     LocalStack SQS Provider.
 
     LIMITATIONS:
-        - Calculation of message attribute MD5 hash.
+        - Calculation of message attribute MD5 hashes
         - Pagination of results (NextToken)
         - Sequence numbering
         - Delivery guarantees
+        - FIFO/Standard queue semantics
         - Message batching
+        - Dead letter queue
     """
 
     queues: Dict[QueueKey, SqsQueue]
@@ -440,7 +461,7 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
         if k in self.queues:
             raise QueueNameExists(queue_name)
 
-        queue = StandardQueue(k, attributes, tags)
+        queue = FifoQueue(k, attributes, tags)
         LOG.debug("creating queue key=%s attributes=%s tags=%s", k, attributes, tags)
         self._add_queue(queue)
 
@@ -591,7 +612,9 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
         messages = list()
         while num:
             try:
-                msg = queue.get(block=block, timeout=wait_time_seconds)
+                msg = queue.get(
+                    block=block, timeout=wait_time_seconds, visibility_timeout=visibility_timeout
+                )
             except Empty:
                 break
 
