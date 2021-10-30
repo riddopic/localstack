@@ -7,15 +7,23 @@ import string
 import threading
 import time
 from queue import Empty, PriorityQueue
-from typing import Dict, NamedTuple, Optional, Set
+from typing import Dict, List, NamedTuple, Optional, Set
 
 from localstack.aws.api import CommonServiceException, RequestContext
 from localstack.aws.api.sqs import (
     ActionNameList,
     AttributeNameList,
     AWSAccountIdList,
+    BatchEntryIdsNotDistinct,
+    BatchResultErrorEntry,
     BoxedInteger,
+    ChangeMessageVisibilityBatchRequestEntryList,
+    ChangeMessageVisibilityBatchResult,
     CreateQueueResult,
+    DeleteMessageBatchRequestEntryList,
+    DeleteMessageBatchResult,
+    DeleteMessageBatchResultEntry,
+    EmptyBatchRequest,
     GetQueueAttributesResult,
     GetQueueUrlResult,
     Integer,
@@ -35,6 +43,9 @@ from localstack.aws.api.sqs import (
     QueueNameExists,
     ReceiptHandleIsInvalid,
     ReceiveMessageResult,
+    SendMessageBatchRequestEntryList,
+    SendMessageBatchResult,
+    SendMessageBatchResultEntry,
     SendMessageResult,
     SqsApi,
     String,
@@ -80,7 +91,8 @@ def assert_queue_name(queue_name: str):
         # The .fifo suffix counts towards the 80-character queue name quota.
         queue_name = queue_name[:-5] + "_fifo"
 
-    if not re.match(r"^[a-zA-Z0-9_-]{1,80}$", queue_name):
+    # slashes are actually not allowed, but we've allowed it explicitly in localstack
+    if not re.match(r"^[a-zA-Z0-9/_-]{1,80}$", queue_name):
         raise InvalidParameterValues(
             "Can only include alphanumeric characters, hyphens, or underscores. 1 to 80 in length"
         )
@@ -119,7 +131,7 @@ class SqsQueue:
 
         self.purge_in_progress = False
         self.permissions = set()
-        self._mutex = threading.RLock()
+        self.mutex = threading.RLock()
 
     def default_attributes(self) -> QueueAttributeMap:
         return {
@@ -244,23 +256,22 @@ class FifoQueue(SqsQueue):
         self.receipts = dict()
 
     def put(self, message: Message, visibility_timeout: int = None):
-        with self._mutex:
-            qm = QueuedMessage(time.time(), message)
+        qm = QueuedMessage(time.time(), message)
 
-            if visibility_timeout is not None:
-                qm.visibility_timeout = visibility_timeout
-            else:
-                # use the attribute from the queue
-                qm.visibility_timeout = self.visibility_timeout
+        if visibility_timeout is not None:
+            qm.visibility_timeout = visibility_timeout
+        else:
+            # use the attribute from the queue
+            qm.visibility_timeout = self.visibility_timeout
 
-            self.visible.put_nowait(qm)
+        self.visible.put_nowait(qm)
 
     def get(self, block=True, timeout=None, visibility_timeout: int = None) -> Message:
         while True:
             qm: QueuedMessage = self.visible.get(block=block, timeout=timeout)
             LOG.debug("de-queued message %s from %s", qm.message_id, self.arn)
 
-            with self._mutex:
+            with self.mutex:
                 if qm.deleted:
                     # TODO: check what the behavior of AWS is here. should we return a deleted message?
                     # FIXME: timeout is not adjusted
@@ -280,7 +291,7 @@ class FifoQueue(SqsQueue):
                 qm.receipt_handles.add(receipt_handle)
                 self.receipts[receipt_handle] = qm
 
-                if self.visibility_timeout == 0:
+                if qm.visibility_timeout == 0:
                     self.visible.put_nowait(qm)
                 else:
                     self.inflight.add(qm)
@@ -293,7 +304,7 @@ class FifoQueue(SqsQueue):
             return message
 
     def update_visibility_timeout(self, receipt_handle: str, visibility_timeout: int):
-        with self._mutex:
+        with self.mutex:
             if receipt_handle not in self.receipts:
                 raise ReceiptHandleIsInvalid()
             qm = self.receipts[receipt_handle]
@@ -305,13 +316,14 @@ class FifoQueue(SqsQueue):
             qm.visibility_timeout = visibility_timeout
 
             if visibility_timeout == 0:
+                LOG.info("terminating the visibility timeout of %s", qm.message_id)
                 # Terminating the visibility timeout for a message
                 # https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html#terminating-message-visibility-timeout
                 self.inflight.remove(qm)
                 self.visible.put_nowait(qm)
 
     def remove(self, receipt_handle: str):
-        with self._mutex:
+        with self.mutex:
             if receipt_handle not in self.receipts:
                 LOG.debug(
                     "no in-flight message found for receipt handle %s in queue %s",
@@ -342,7 +354,7 @@ class FifoQueue(SqsQueue):
         if not self.inflight:
             return
 
-        with self._mutex:
+        with self.mutex:
             messages = list(self.inflight)
             for qm in messages:
                 if qm.is_visible:
@@ -516,9 +528,45 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
         receipt_handle: String,
         visibility_timeout: Integer,
     ) -> None:
-
         queue = self._require_queue_by_url(queue_url)
+        self._assert_permission(context, queue)
         queue.update_visibility_timeout(receipt_handle, visibility_timeout)
+
+    def change_message_visibility_batch(
+        self,
+        context: RequestContext,
+        queue_url: String,
+        entries: ChangeMessageVisibilityBatchRequestEntryList,
+    ) -> ChangeMessageVisibilityBatchResult:
+        queue = self._require_queue_by_url(queue_url)
+        self._assert_permission(context, queue)
+
+        self._assert_batch(entries)
+
+        successful = list()
+        failed = list()
+
+        with queue.mutex:
+            for entry in entries:
+                try:
+                    queue.update_visibility_timeout(
+                        entry["ReceiptHandle"], entry["VisibilityTimeout"]
+                    )
+                    successful.append({"Id": entry["Id"]})
+                except Exception as e:
+                    failed.append(
+                        BatchResultErrorEntry(
+                            Id=entry["Id"],
+                            SenderFault=False,
+                            Code=e.__class__.__name__,
+                            Message=str(e),
+                        )
+                    )
+
+        return ChangeMessageVisibilityBatchResult(
+            Successful=successful,
+            Failed=failed,
+        )
 
     def delete_queue(self, context: RequestContext, queue_url: String) -> None:
         with self._mutex:
@@ -565,6 +613,85 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
         queue = self._require_queue_by_url(queue_url)
         self._assert_permission(context, queue)
 
+        message = self._put_message(
+            queue,
+            context,
+            message_body,
+            delay_seconds,
+            message_attributes,
+            message_system_attributes,
+            message_deduplication_id,
+            message_group_id,
+        )
+        return SendMessageResult(
+            MessageId=message["MessageId"],
+            MD5OfMessageBody=message["MD5OfBody"],
+            MD5OfMessageAttributes=None,  # TODO
+            SequenceNumber=None,  # TODO
+            MD5OfMessageSystemAttributes=None,  # TODO
+        )
+
+    def send_message_batch(
+        self, context: RequestContext, queue_url: String, entries: SendMessageBatchRequestEntryList
+    ) -> SendMessageBatchResult:
+        queue = self._require_queue_by_url(queue_url)
+        self._assert_permission(context, queue)
+
+        self._assert_batch(entries)
+
+        successful = list()
+        failed = list()
+
+        with queue.mutex:
+            for entry in entries:
+                try:
+                    message = self._put_message(
+                        queue,
+                        context,
+                        message_body=entry.get("MessageBody"),
+                        delay_seconds=entry.get("DelaySeconds"),
+                        message_attributes=entry.get("MessageAttributes"),
+                        message_system_attributes=entry.get("MessageSystemAttributes"),
+                        message_deduplication_id=entry.get("MessageDeduplicationId"),
+                        message_group_id=entry.get("MessageGroupId"),
+                    )
+
+                    successful.append(
+                        SendMessageBatchResultEntry(
+                            Id=entry["Id"],
+                            MessageId=message.get("MessageId"),
+                            MD5OfMessageBody=message.get("MD5OfBody"),
+                            MD5OfMessageAttributes="",  # TODO
+                            MD5OfMessageSystemAttributes=None,  # TODO
+                            SequenceNumber=None,  # TODO
+                        )
+                    )
+                except Exception as e:
+                    failed.append(
+                        BatchResultErrorEntry(
+                            Id=entry["Id"],
+                            SenderFault=False,
+                            Code=e.__class__.__name__,
+                            Message=str(e),
+                        )
+                    )
+
+        return SendMessageBatchResult(
+            Successful=successful,
+            Failed=failed,
+        )
+
+    def _put_message(
+        self,
+        queue: SqsQueue,
+        context: RequestContext,
+        message_body: String,
+        delay_seconds: Integer = None,
+        message_attributes: MessageBodyAttributeMap = None,  # TODO
+        message_system_attributes: MessageBodySystemAttributeMap = None,  # TODO
+        message_deduplication_id: String = None,  # TODO
+        message_group_id: String = None,  # TODO
+    ) -> Message:
         # TODO: default message attributes (SenderId, ApproximateFirstReceiveTimestamp, ...)
 
         message: Message = Message(
@@ -576,7 +703,7 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
             MessageAttributes=message_attributes,
         )
 
-        delay_seconds = delay_seconds or queue.attributes.get(QueueAttributeName.DelaySeconds, 0)
+        delay_seconds = delay_seconds or queue.attributes.get(QueueAttributeName.DelaySeconds, "0")
         if delay_seconds:
             # FIXME: this is a pretty bad implementation (one thread per message...). polling on a priority queue
             #  would probably be better.
@@ -584,13 +711,7 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
         else:
             queue.put(message)
 
-        return SendMessageResult(
-            MessageId=message["MessageId"],
-            MD5OfMessageBody=message["MD5OfBody"],
-            MD5OfMessageAttributes=None,  # TODO
-            SequenceNumber=None,  # TODO
-            MD5OfMessageSystemAttributes=None,  # TODO
-        )
+        return message
 
     def receive_message(
         self,
@@ -626,7 +747,7 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
                         for k, v in msg["MessageAttributes"].items()
                         if k in message_attribute_names
                     }
-                msg["MD5OfMessageAttributes"] = None  # TODO
+                msg["MD5OfMessageAttributes"] = ""  # TODO
             else:
                 del msg["MessageAttributes"]
 
@@ -643,6 +764,39 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
         queue = self._require_queue_by_url(queue_url)
         self._assert_permission(context, queue)
         queue.remove(receipt_handle)
+
+    def delete_message_batch(
+        self,
+        context: RequestContext,
+        queue_url: String,
+        entries: DeleteMessageBatchRequestEntryList,
+    ) -> DeleteMessageBatchResult:
+        queue = self._require_queue_by_url(queue_url)
+        self._assert_permission(context, queue)
+        self._assert_batch(entries)
+
+        successful = list()
+        failed = list()
+
+        with queue.mutex:
+            for entry in entries:
+                try:
+                    queue.remove(entry["ReceiptHandle"])
+                    successful.append(DeleteMessageBatchResultEntry(Id=entry["Id"]))
+                except Exception as e:
+                    failed.append(
+                        BatchResultErrorEntry(
+                            Id=entry["Id"],
+                            SenderFault=False,
+                            Code=e.__class__.__name__,
+                            Message=str(e),
+                        )
+                    )
+
+        return DeleteMessageBatchResult(
+            Successful=successful,
+            Failed=failed,
+        )
 
     def purge_queue(self, context: RequestContext, queue_url: String) -> None:
         queue = self._require_queue_by_url(queue_url)
@@ -781,3 +935,14 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
                 return
 
         raise CommonServiceException("AccessDeniedException", "Not allowed (TODO: correct message)")
+
+    def _assert_batch(self, batch: List):
+        if not batch:
+            raise EmptyBatchRequest
+        visited = set()
+        for entry in batch:
+            # TODO: InvalidBatchEntryId
+            if entry["Id"] in visited:
+                raise BatchEntryIdsNotDistinct()
+            else:
+                visited.add(entry["Id"])
