@@ -135,7 +135,7 @@ class Service(object):
     def __init__(
         self,
         name,
-        start=None,
+        start=_default,
         check=_default,
         listener=None,
         active=False,
@@ -155,6 +155,9 @@ class Service(object):
         call_safe(self.lifecycle_hook.on_before_start)
 
         if not self.start_function:
+            return
+
+        if self.start_function is _default:
             # fallback start method that simply adds the listener function to the list of proxy listeners if it exists
             if not self.listener:
                 return
